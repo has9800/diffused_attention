@@ -225,19 +225,24 @@ def run_evaluation(
 
         for context_length in context_lengths:
             print(f"Evaluating {method} at context {context_length} ...", flush=True)
-            ppl = evaluate_perplexity(
-                model=model,
-                token_buffer=token_buffer,
-                context_length=context_length,
-                batch_size=batch_size,
-                device=device,
-                max_batches=max_batches,
-            )
+            try:
+                ppl = evaluate_perplexity(
+                    model=model,
+                    token_buffer=token_buffer,
+                    context_length=context_length,
+                    batch_size=batch_size,
+                    device=device,
+                    max_batches=max_batches,
+                )
+                ppl_str = f"{ppl:.6f}"
+            except RuntimeError as e:
+                print(f"Warning: failed at context {context_length} for {method}: {e}")
+                ppl_str = "nan"
             rows.append(
                 {
                     "context_length": context_length,
                     "method": method,
-                    "perplexity": f"{ppl:.6f}",
+                    "perplexity": ppl_str,
                 }
             )
 

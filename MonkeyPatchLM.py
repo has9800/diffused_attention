@@ -1,9 +1,14 @@
 import math
+import inspect
 from typing import Iterable, Optional, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+try:
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding  # type: ignore
+except Exception:  # pragma: no cover
+    LlamaRotaryEmbedding = None  # type: ignore
 
 from AdaptivePerHeadAttention import AdaptivePerHeadAttention
 
@@ -33,7 +38,11 @@ def _make_adaptive_attn(
     def patched_attn(query_states, key_states, value_states, attention_mask=None, **kwargs):
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * scaling
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+            if attention_mask.dtype == torch.bool:
+                neg = -1e4 if attn_scores.dtype == torch.float16 else -1e9
+                attn_scores = attn_scores.masked_fill(~attention_mask, neg)
+            else:
+                attn_scores = attn_scores + attention_mask
 
         probs = adaptive_module(attn_scores, attention_mask=None, sink_indices=sink_indices)
         probs = F.dropout(probs, p=dropout_p, training=attn_module.training)
@@ -85,6 +94,8 @@ def _make_adaptive_forward(
 
         present_key_value = (key_states, value_states) if use_cache else None
 
+        # Apply rotary embeddings using the module's provider if available.
+        # Otherwise, lazily construct a LlamaRotaryEmbedding as a fallback.
         rotary_kwargs = {}
         if position_ids is not None:
             rotary_kwargs["position_ids"] = position_ids
@@ -93,15 +104,47 @@ def _make_adaptive_forward(
         elif "cache_position" in kwargs and kwargs["cache_position"] is not None:
             rotary_kwargs["position_ids"] = kwargs["cache_position"]
 
-        cos, sin = attn_module.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, **rotary_kwargs)
+        cos = sin = None
+        if hasattr(attn_module, "rotary_emb") and callable(getattr(attn_module, "rotary_emb")):
+            try:
+                cos, sin = attn_module.rotary_emb(value_states, seq_len=kv_seq_len)
+            except TypeError:
+                # Some variants expect only seq_len.
+                cos, sin = attn_module.rotary_emb(value_states, kv_seq_len)
+        if cos is None or sin is None:
+            rope = getattr(attn_module, "_adaptive_rotary", None)
+            if rope is None and LlamaRotaryEmbedding is not None:
+                try:
+                    sig = inspect.signature(LlamaRotaryEmbedding.__init__)
+                    if "config" in sig.parameters:
+                        cfg = getattr(attn_module, "config", getattr(getattr(attn_module, "_config", None), "config", None))
+                        if cfg is not None:
+                            rope = LlamaRotaryEmbedding(cfg)
+                    elif "dim" in sig.parameters:
+                        base = getattr(attn_module, "rotary_emb_base", getattr(attn_module, "rope_theta", 10000))
+                        rope = LlamaRotaryEmbedding(dim=meta.head_dim, base=base)
+                    else:
+                        rope = LlamaRotaryEmbedding(meta.head_dim)
+                except Exception:
+                    rope = None
+                if rope is not None:
+                    attn_module._adaptive_rotary = rope
+            if rope is not None:
+                cos, sin = rope(value_states, seq_len=kv_seq_len)
+
+        if cos is not None and sin is not None:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, **rotary_kwargs)
 
         key_states = repeat_kv(key_states, meta.num_key_value_groups)
         value_states = repeat_kv(value_states, meta.num_key_value_groups)
 
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(meta.head_dim)
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+            if attention_mask.dtype == torch.bool:
+                neg = -1e4 if attn_scores.dtype == torch.float16 else -1e9
+                attn_scores = attn_scores.masked_fill(~attention_mask, neg)
+            else:
+                attn_scores = attn_scores + attention_mask
 
         probs = adaptive_module(attn_scores, attention_mask=None, sink_indices=sink_indices)
         dropout_p = getattr(attn_module, "attention_dropout", getattr(attn_module, "dropout", 0.0))
