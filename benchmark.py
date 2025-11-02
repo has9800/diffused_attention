@@ -74,26 +74,21 @@ class AdaptivePerHeadAttention(nn.Module):
         sink_mask = torch.zeros(src_len, device=weights.device, dtype=torch.bool)
         sink_mask[sink_indices] = True
         content_mask = ~sink_mask
-        
-        # FIX: Keep everything in same dtype as weights
-        sink_mass = weights[..., sink_mask].sum(dim=-1, keepdim=True).to(weights.dtype)
-        content_mass = weights[..., content_mask].sum(dim=-1, keepdim=True).to(weights.dtype)
-        epsilon_expanded = self._prepare_epsilon(epsilon, self.num_heads, weights.device, weights.dtype)
-        
-        output = torch.zeros_like(weights)
-        
-        # FIX: Cast results back to weights.dtype
-        output[..., content_mask] = (
-            (weights[..., content_mask]
-            * (1.0 - epsilon_expanded)
-            / (content_mass + 1e-9)).to(weights.dtype)
-        )
-        output[..., sink_mask] = (
-            (weights[..., sink_mask]
-            * epsilon_expanded
-            / (sink_mass + 1e-9)).to(weights.dtype)
-        )
-        return output
+
+        # Convert to float32 for stability
+        weights_fp32 = weights.float()
+        epsilon_expanded = self._prepare_epsilon(epsilon, self.num_heads, weights.device, weights_fp32.dtype)
+
+        sink_mass = weights_fp32[..., sink_mask].sum(dim=-1, keepdim=True)
+        content_mass = weights_fp32[..., content_mask].sum(dim=-1, keepdim=True)
+
+        output = torch.zeros_like(weights_fp32)
+        output[..., content_mask] = (weights_fp32[..., content_mask] * (1.0 - epsilon_expanded) / (content_mass + 1e-6))
+        output[..., sink_mask] = (weights_fp32[..., sink_mask] * epsilon_expanded / (sink_mass + 1e-6))
+
+        # Cast back to original dtype
+        return output.to(weights.dtype)
+
 
 
     def forward(
