@@ -104,13 +104,22 @@ def _make_adaptive_forward(
         elif "cache_position" in kwargs and kwargs["cache_position"] is not None:
             rotary_kwargs["position_ids"] = kwargs["cache_position"]
 
+        # Build a safe position_ids tensor for rotary modules that expect it.
+        pos_ids = rotary_kwargs.get("position_ids")
+        if pos_ids is None:
+            pos_ids = torch.arange(kv_seq_len, device=value_states.device, dtype=torch.long).unsqueeze(0)
+            pos_ids = pos_ids.expand(bsz, -1)
+
         cos = sin = None
         if hasattr(attn_module, "rotary_emb") and callable(getattr(attn_module, "rotary_emb")):
             try:
                 cos, sin = attn_module.rotary_emb(value_states, seq_len=kv_seq_len)
             except TypeError:
-                # Some variants expect only seq_len.
-                cos, sin = attn_module.rotary_emb(value_states, kv_seq_len)
+                try:
+                    cos, sin = attn_module.rotary_emb(value_states, position_ids=pos_ids)
+                except TypeError:
+                    # Some variants expect only x and infer length internally.
+                    cos, sin = attn_module.rotary_emb(value_states)
         if cos is None or sin is None:
             rope = getattr(attn_module, "_adaptive_rotary", None)
             if rope is None and LlamaRotaryEmbedding is not None:
@@ -131,12 +140,16 @@ def _make_adaptive_forward(
                     attn_module._adaptive_rotary = rope
             if rope is not None:
                 try:
-                    cos, sin = rope(value_states, seq_len=kv_seq_len)
+                    # Prefer passing proper position_ids when available.
+                    cos, sin = rope(value_states, position_ids=pos_ids)
                 except TypeError:
                     try:
-                        cos, sin = rope(value_states, kv_seq_len)
+                        cos, sin = rope(value_states, seq_len=kv_seq_len)
                     except TypeError:
-                        cos, sin = rope(value_states)
+                        try:
+                            cos, sin = rope(value_states, kv_seq_len)
+                        except TypeError:
+                            cos, sin = rope(value_states)
 
         if cos is not None and sin is not None:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, **rotary_kwargs)
