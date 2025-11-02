@@ -11,7 +11,7 @@ import random
 import string
 import pandas as pd
 import matplotlib.pyplot as plt
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import os
 import nltk
 
@@ -181,10 +181,11 @@ class CustomQwen2Attention(Qwen2Attention):
 
 # Patch function
 def patch_model_with_custom_attention(model, device):
+    dtype = model.dtype
     for i, layer in enumerate(model.model.layers):
         custom_attn = CustomQwen2Attention(model.config, layer_idx=i)
+        custom_attn.to(dtype=dtype, device=device)
         custom_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
-        custom_attn.to(device)
         layer.self_attn = custom_attn
     return model
 
@@ -210,7 +211,7 @@ def eval_language_modeling(model, tokenizer, context_lengths, device, batch_size
             nlls = []
             for begin_loc in range(0, seq_len, stride):
                 end_loc = min(begin_loc + effective_context, seq_len)
-                if end_loc - begin_loc <= 1:  # Changed to <=1 to include small sequences
+                if end_loc - begin_loc <= 1:
                     continue
                 input_ids = encodings.input_ids[:, begin_loc:end_loc]
                 if input_ids.size(1) > max_model_len:
@@ -274,6 +275,7 @@ def eval_code_completion(model, tokenizer, device, num_examples=50):
     full_dataset = load_dataset("mbpp", split="test", cache_dir="/data/cache")
     dataset = full_dataset.select(range(num_examples))  # Select subset as Dataset
     results = []
+    chencherry = SmoothingFunction()
     for example in dataset:
         code = example['code']
         split_point = len(code) // 2
@@ -285,10 +287,10 @@ def eval_code_completion(model, tokenizer, device, num_examples=50):
         with torch.no_grad():
             output_ids = model.generate(**inputs, max_new_tokens=len(target) // 4 + 10, do_sample=False)  # Approx tokens
         prediction = tokenizer.decode(output_ids[0][inputs.input_ids.size(1):], skip_special_tokens=True).strip()
-        # BLEU (using words)
+        # BLEU with smoothing
         reference = [target.split()]
         candidate = prediction.split()
-        bleu = sentence_bleu(reference, candidate)
+        bleu = sentence_bleu(reference, candidate, smoothing_function=chencherry.method1)
         results.append({
             'bleu': bleu,
             'language': 'python',
@@ -299,7 +301,7 @@ def eval_code_completion(model, tokenizer, device, num_examples=50):
 def run_benchmarks(model_name="Qwen/Qwen2.5-7B", device='cuda', context_lengths=[8192, 16384, 32768, 65536]):
     os.makedirs("/data/cache", exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir="/data/cache")
-    original_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, cache_dir="/data/cache").to(device)
+    original_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16, cache_dir="/data/cache").to(device)
     
     # Original evaluations
     lm_results_orig = eval_language_modeling(original_model, tokenizer, context_lengths, device)
