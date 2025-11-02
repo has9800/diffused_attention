@@ -276,7 +276,7 @@ def eval_humaneval(model, tokenizer, num_samples=10, device='cuda'):
 def run_benchmarks(
     model_name="Qwen/Qwen2.5-7B",
     device='cuda',
-    num_samples=10,
+    num_samples=50,
     output_dir="/tmp/humaneval_benchmark"
 ):
     """Run HumanEval benchmark."""
