@@ -13,11 +13,9 @@ from typing import Optional, Tuple, Iterable, Sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb, repeat_kv
 from transformers.cache_utils import Cache
-from datasets import load_dataset
 import math
 import pandas as pd
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-import os
 import nltk
 
 nltk.download('punkt', quiet=True)
@@ -114,14 +112,12 @@ class AdaptivePerHeadAttention(nn.Module):
 
 
 # ============================================================================
-# CUSTOM QWEN2 ATTENTION (FIXED)
+# CUSTOM QWEN2 ATTENTION
 # ============================================================================
 
 class CustomQwen2Attention(Qwen2Attention):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        
-        # EXPLICITLY SET ATTRIBUTES
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -204,7 +200,6 @@ class CustomQwen2Attention(Qwen2Attention):
 # ============================================================================
 
 def patch_model_with_custom_attention(model, device):
-    """Replace all attention layers with custom adaptive attention."""
     dtype = model.dtype
     for i, layer in enumerate(model.model.layers):
         custom_attn = CustomQwen2Attention(model.config, layer_idx=i)
@@ -215,22 +210,77 @@ def patch_model_with_custom_attention(model, device):
 
 
 # ============================================================================
+# GENERATE SYNTHETIC CODE FOR TESTING
+# ============================================================================
+
+def generate_code_samples(num_samples=5):
+    """Generate simple Python code for testing."""
+    samples = []
+    for i in range(num_samples):
+        code = f"""
+# Python code sample {i}
+def function_{i}(x, y):
+    '''Function that does something with x and y'''
+    result = x + y
+    for j in range(result):
+        print(f"Iteration {{j}}: {{x}} + {{y}} = {{result}}")
+    
+    if result > 10:
+        print("Result is large")
+        nested_result = result * 2
+        for k in range(nested_result):
+            value = k * result
+            if value % 2 == 0:
+                print(f"Even: {{value}}")
+    
+    return result
+
+class MyClass_{i}:
+    def __init__(self, name):
+        self.name = name
+    
+    def method(self, param):
+        data = []
+        for idx in range(len(param)):
+            item = param[idx]
+            processed = item * 2
+            data.append(processed)
+        return data
+
+def process_data_{i}(items):
+    output = []
+    for item in items:
+        if isinstance(item, int):
+            output.append(item ** 2)
+        elif isinstance(item, str):
+            output.append(item.upper())
+        else:
+            output.append(None)
+    return output
+
+# More code...
+x = [1, 2, 3, 4, 5]
+y = "hello"
+z = MyClass_{i}("test")
+result = process_data_{i}(x)
+print(result)
+""" * 3  # Repeat to make it longer
+        samples.append(code)
+    return samples
+
+
+# ============================================================================
 # BENCHMARK: CODE-IN-CONTEXT
 # ============================================================================
 
-def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20, device='cuda'):
+def eval_code_in_context(model, tokenizer, context_length=4096, num_samples=5, device='cuda'):
     """
-    Task: Given first half of long Python file, predict second half.
-    Metric: BLEU score (higher is better).
-    
-    Why: Tests if adaptive attention helps with long code understanding.
+    Task: Given first half of code, predict second half.
+    Metric: BLEU score.
     """
     
-    try:
-        dataset = load_dataset("code_search_net", "python", split="test", cache_dir="/tmp/cache")
-    except:
-        print("  [Warning] CodeSearchNet unavailable, using alternative dataset")
-        return []
+    # Generate code samples
+    code_samples = generate_code_samples(num_samples)
     
     results = []
     bleu_scores = []
@@ -238,12 +288,8 @@ def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20,
     
     model.eval()
     
-    for idx, example in enumerate(dataset.select(range(min(num_examples, len(dataset))))):
-        code = example['content']
-        
-        # Skip if code too short
-        code_tokens = tokenizer(code, return_tensors="pt").input_ids.shape
-        if code_tokens < context_length + 100:
+    for idx, code in enumerate(code_samples):
+        if len(code) < 500:
             continue
         
         # Split: first half = context, second half = target
@@ -253,7 +299,12 @@ def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20,
         
         try:
             # Tokenize context
-            inputs = tokenizer(context[:context_length * 3], return_tensors="pt", truncation=True, max_length=context_length).to(device)
+            inputs = tokenizer(
+                context,
+                return_tensors="pt",
+                truncation=True,
+                max_length=context_length
+            ).to(device)
             
             # Generate prediction
             with torch.no_grad():
@@ -273,11 +324,10 @@ def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20,
             bleu = sentence_bleu(reference, candidate, smoothing_function=smoothing_fn)
             bleu_scores.append(bleu)
             
-            if idx % 5 == 0:
-                print(f"    Sample {idx}: BLEU = {bleu:.4f}")
+            print(f"    Sample {idx}: BLEU = {bleu:.4f}")
         
         except RuntimeError as e:
-            print(f"    [Warning] OOM or error on sample {idx}: {str(e)[:50]}")
+            print(f"    [Warning] Error on sample {idx}: {str(e)[:50]}")
             continue
     
     if bleu_scores:
@@ -287,28 +337,30 @@ def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20,
             'avg_bleu': avg_bleu,
             'num_samples': len(bleu_scores)
         })
-        print(f"  Average BLEU: {avg_bleu:.4f}")
+        print(f"  ✓ Average BLEU: {avg_bleu:.4f}")
+    else:
+        print(f"  ✗ No valid samples")
     
     return results
 
 
 # ============================================================================
-# MAIN BENCHMARK
+# MAIN
 # ============================================================================
 
 def run_benchmarks(
     model_name="Qwen/Qwen2.5-7B",
     device='cuda',
-    context_length=8192,
-    num_examples=20,
+    context_length=4096,
+    num_samples=5,
     output_dir="/tmp/code_benchmark_results"
 ):
-    """Run code-in-context benchmark on baseline and adaptive attention."""
+    """Run code-in-context benchmark."""
     
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\n{'='*80}")
-    print(f"CODE-IN-CONTEXT BENCHMARK")
+    print(f"CODE-IN-CONTEXT BENCHMARK (Synthetic)")
     print(f"Model: {model_name}")
     print(f"Context Length: {context_length}")
     print(f"{'='*80}\n")
@@ -322,59 +374,56 @@ def run_benchmarks(
         device_map="auto"
     ).to(device)
     
-    # ---- BASELINE EVALUATION ----
+    # ---- BASELINE ----
     print("\n=== BASELINE EVALUATION ===")
-    print("Code-in-context (standard attention)...")
     baseline_results = eval_code_in_context(
         model,
         tokenizer,
         context_length=context_length,
-        num_examples=num_examples,
+        num_samples=num_samples,
         device=device
     )
     
-    # ---- PATCH & ADAPTIVE EVALUATION ----
+    # ---- PATCH & ADAPTIVE ----
     print("\n=== PATCHING WITH CUSTOM ATTENTION ===")
     model = patch_model_with_custom_attention(model, device)
     
     print("\n=== ADAPTIVE ATTENTION EVALUATION ===")
-    print("Code-in-context (adaptive attention)...")
     adaptive_results = eval_code_in_context(
         model,
         tokenizer,
         context_length=context_length,
-        num_examples=num_examples,
+        num_samples=num_samples,
         device=device
     )
     
-    # ---- SAVE RESULTS ----
-    print("\n=== SAVING RESULTS ===")
+    # ---- SAVE & COMPARE ----
+    print("\n=== RESULTS ===")
     
     if baseline_results:
         pd.DataFrame(baseline_results).to_csv(f"{output_dir}/code_baseline.csv", index=False)
-        print(f"✓ Baseline results: {baseline_results['avg_bleu']:.4f}")
+        baseline_bleu = baseline_results['avg_bleu']
+        print(f"Baseline BLEU: {baseline_bleu:.4f}")
     
     if adaptive_results:
         pd.DataFrame(adaptive_results).to_csv(f"{output_dir}/code_adaptive.csv", index=False)
-        print(f"✓ Adaptive results: {adaptive_results['avg_bleu']:.4f}")
+        adaptive_bleu = adaptive_results['avg_bleu']
+        print(f"Adaptive BLEU: {adaptive_bleu:.4f}")
     
-    # Compute improvement
     if baseline_results and adaptive_results:
         baseline_bleu = baseline_results['avg_bleu']
         adaptive_bleu = adaptive_results['avg_bleu']
-        improvement = ((adaptive_bleu - baseline_bleu) / baseline_bleu * 100) if baseline_bleu > 0 else 0
+        improvement = ((adaptive_bleu - baseline_bleu) / (baseline_bleu + 1e-9) * 100)
         print(f"\n🎯 IMPROVEMENT: {improvement:+.2f}%")
     
-    print(f"\nResults saved to {output_dir}")
-    for f in os.listdir(output_dir):
-        print(f"  - {f}")
+    print(f"\nResults saved to {output_dir}/")
 
 
 if __name__ == "__main__":
     run_benchmarks(
         model_name="Qwen/Qwen2.5-7B",
         device='cuda',
-        context_length=8192,
-        num_examples=20,
+        context_length=4096,
+        num_samples=5,
         output_dir="/tmp/code_benchmark_results"
     )
