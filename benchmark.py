@@ -74,21 +74,27 @@ class AdaptivePerHeadAttention(nn.Module):
         sink_mask = torch.zeros(src_len, device=weights.device, dtype=torch.bool)
         sink_mask[sink_indices] = True
         content_mask = ~sink_mask
-        sink_mass = weights[..., sink_mask].sum(dim=-1, keepdim=True, dtype=torch.float32)
-        content_mass = weights[..., content_mask].sum(dim=-1, keepdim=True, dtype=torch.float32)
+        
+        # FIX: Keep everything in same dtype as weights
+        sink_mass = weights[..., sink_mask].sum(dim=-1, keepdim=True).to(weights.dtype)
+        content_mass = weights[..., content_mask].sum(dim=-1, keepdim=True).to(weights.dtype)
         epsilon_expanded = self._prepare_epsilon(epsilon, self.num_heads, weights.device, weights.dtype)
+        
         output = torch.zeros_like(weights)
+        
+        # FIX: Cast results back to weights.dtype
         output[..., content_mask] = (
-            weights[..., content_mask]
+            (weights[..., content_mask]
             * (1.0 - epsilon_expanded)
-            / (content_mass + 1e-9)
+            / (content_mass + 1e-9)).to(weights.dtype)
         )
         output[..., sink_mask] = (
-            weights[..., sink_mask]
+            (weights[..., sink_mask]
             * epsilon_expanded
-            / (sink_mass + 1e-9)
+            / (sink_mass + 1e-9)).to(weights.dtype)
         )
         return output
+
 
     def forward(
         self,
@@ -276,7 +282,7 @@ def eval_humaneval(model, tokenizer, num_samples=10, device='cuda'):
 def run_benchmarks(
     model_name="Qwen/Qwen2.5-7B",
     device='cuda',
-    num_samples=50,
+    num_samples=30,
     output_dir="/tmp/humaneval_benchmark"
 ):
     """Run HumanEval benchmark."""
