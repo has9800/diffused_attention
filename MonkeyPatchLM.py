@@ -94,11 +94,11 @@ def _make_adaptive_forward(
             attn_scores = attn_scores + attention_mask
 
         probs = adaptive_module(attn_scores, attention_mask=None, sink_indices=sink_indices)
-        dropout_p = getattr(attn_module, "attention_dropout", 0.0)
+        dropout_p = getattr(attn_module, "attention_dropout", getattr(attn_module, "dropout", 0.0))
         probs = F.dropout(probs, p=dropout_p, training=attn_module.training)
 
         attn_output = torch.matmul(probs, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, attn_module.hidden_size)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, adaptive_module.dim)
         attn_output = attn_module.o_proj(attn_output)
 
         if not output_attentions:
@@ -146,8 +146,18 @@ def patch_attention(
         if hasattr(attn, "_adaptive_module"):
             adaptive_module = attn._adaptive_module
         else:
+            hidden_size = getattr(attn, "hidden_size", None)
+            if hidden_size is None:
+                q_proj = getattr(attn, "q_proj", None)
+                if q_proj is not None and hasattr(q_proj, "out_features"):
+                    hidden_size = q_proj.out_features
+                elif q_proj is not None and hasattr(q_proj, "weight"):
+                    hidden_size = q_proj.weight.shape[0]
+                else:
+                    raise AttributeError("Unable to infer attention hidden size for adaptive patching.")
+
             adaptive_module = AdaptivePerHeadAttention(
-                dim=attn.hidden_size,
+                dim=hidden_size,
                 num_heads=attn.num_heads,
                 layer_idx=layer_idx,
                 num_layers=num_layers,
