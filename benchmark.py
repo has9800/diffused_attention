@@ -1,3 +1,11 @@
+import os
+os.environ['HF_HOME'] = '/data/huggingface_cache'
+os.environ['TRANSFORMERS_CACHE'] = '/data/huggingface_cache'
+os.environ['HF_DATASETS_CACHE'] = '/data/datasets_cache'
+os.makedirs('/data/huggingface_cache', exist_ok=True)
+os.makedirs('/data/datasets_cache', exist_ok=True)
+os.makedirs('/data/cache', exist_ok=True)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
