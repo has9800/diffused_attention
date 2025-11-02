@@ -130,7 +130,13 @@ def _make_adaptive_forward(
                 if rope is not None:
                     attn_module._adaptive_rotary = rope
             if rope is not None:
-                cos, sin = rope(value_states, seq_len=kv_seq_len)
+                try:
+                    cos, sin = rope(value_states, seq_len=kv_seq_len)
+                except TypeError:
+                    try:
+                        cos, sin = rope(value_states, kv_seq_len)
+                    except TypeError:
+                        cos, sin = rope(value_states)
 
         if cos is not None and sin is not None:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, **rotary_kwargs)
