@@ -114,6 +114,15 @@ class AdaptivePerHeadAttention(nn.Module):
 class CustomQwen2Attention(Qwen2Attention):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
+        
+        # FIX: Explicitly setting attributes
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        
+        # FULL INITIALIZATION
         self.custom_softmax = AdaptivePerHeadAttention(
             dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -122,6 +131,7 @@ class CustomQwen2Attention(Qwen2Attention):
             use_adaptive=True,
             enable_two_pool=True,
         )
+
 
     def forward(
         self,
