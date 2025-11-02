@@ -208,10 +208,9 @@ def eval_language_modeling(model, tokenizer, context_lengths, device, batch_size
                 continue
 
             nlls = []
-            prev_end_loc = 0
             for begin_loc in range(0, seq_len, stride):
                 end_loc = min(begin_loc + effective_context, seq_len)
-                if end_loc - begin_loc < effective_context // 2:
+                if end_loc - begin_loc <= 1:  # Changed to <=1 to include small sequences
                     continue
                 input_ids = encodings.input_ids[:, begin_loc:end_loc]
                 if input_ids.size(1) > max_model_len:
@@ -272,7 +271,8 @@ def eval_passkey_retrieval(model, tokenizer, context_lengths=[32768, 65536], dev
     return results
 
 def eval_code_completion(model, tokenizer, device, num_examples=50):
-    dataset = load_dataset("mbpp", split="test", cache_dir="/data/cache")[:num_examples]  # Small subset
+    full_dataset = load_dataset("mbpp", split="test", cache_dir="/data/cache")
+    dataset = full_dataset.select(range(num_examples))  # Select subset as Dataset
     results = []
     for example in dataset:
         code = example['code']
@@ -342,8 +342,8 @@ def run_benchmarks(model_name="Qwen/Qwen2.5-7B", device='cuda', context_lengths=
     plt.savefig("/data/plot_passkey.png")
     
     # Code BLEU (average)
-    avg_bleu_orig = sum(r['bleu'] for r in code_results_orig) / len(code_results_orig)
-    avg_bleu_custom = sum(r['bleu'] for r in code_results_custom) / len(code_results_custom)
+    avg_bleu_orig = sum(r['bleu'] for r in code_results_orig) / len(code_results_orig) if code_results_orig else 0
+    avg_bleu_custom = sum(r['bleu'] for r in code_results_custom) / len(code_results_custom) if code_results_custom else 0
     print(f"Average BLEU Original: {avg_bleu_orig}")
     print(f"Average BLEU Custom: {avg_bleu_custom}")
     
