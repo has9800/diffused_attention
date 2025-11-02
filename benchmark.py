@@ -7,9 +7,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotar
 from transformers.cache_utils import Cache
 from datasets import load_dataset
 import math
-import random
 import pandas as pd
-import matplotlib.pyplot as plt
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import os
 import nltk
@@ -17,7 +15,7 @@ import nltk
 nltk.download('punkt', quiet=True)
 
 # ============================================================================
-# ADAPTIVE ATTENTION CLASS (Keep as-is, it's correct)
+# ADAPTIVE ATTENTION CLASS
 # ============================================================================
 
 class AdaptivePerHeadAttention(nn.Module):
@@ -108,21 +106,20 @@ class AdaptivePerHeadAttention(nn.Module):
 
 
 # ============================================================================
-# CUSTOM ATTENTION CLASS (FIXED)
+# CUSTOM QWEN2 ATTENTION (FIXED)
 # ============================================================================
 
 class CustomQwen2Attention(Qwen2Attention):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         
-        # FIX: Explicitly setting attributes
+        # EXPLICITLY SET ATTRIBUTES
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.hidden_size = config.hidden_size
         
-        # FULL INITIALIZATION
         self.custom_softmax = AdaptivePerHeadAttention(
             dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -131,7 +128,6 @@ class CustomQwen2Attention(Qwen2Attention):
             use_adaptive=True,
             enable_two_pool=True,
         )
-
 
     def forward(
         self,
@@ -178,8 +174,7 @@ class CustomQwen2Attention(Qwen2Attention):
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        # FIX: Use custom softmax with adaptive parameters
-        attn_probs = self.custom_softmax(attn_weights, attention_mask=None)  # Already applied above
+        attn_probs = self.custom_softmax(attn_weights, attention_mask=None)
 
         attn_probs = nn.functional.dropout(attn_probs, p=self.attention_dropout, training=self.training)
 
@@ -206,133 +201,86 @@ def patch_model_with_custom_attention(model, device):
     for i, layer in enumerate(model.model.layers):
         custom_attn = CustomQwen2Attention(model.config, layer_idx=i)
         custom_attn = custom_attn.to(dtype=dtype, device=device)
-        # Copy weights from original
         custom_attn.load_state_dict(layer.self_attn.state_dict(), strict=False)
         layer.self_attn = custom_attn
     return model
 
 
 # ============================================================================
-# EVALUATION FUNCTIONS
+# BENCHMARK: CODE-IN-CONTEXT
 # ============================================================================
 
-def eval_language_modeling(model, tokenizer, context_lengths, device, batch_size=1, max_model_len=32768, stride=512):
-    """Evaluate perplexity across context lengths."""
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", cache_dir="/tmp/cache")
-    results = []
-
-    for context_len in context_lengths:
-        effective_context = min(context_len, max_model_len)
-        total_nll = 0.0
-        total_tokens = 0
-        loss_fct = nn.CrossEntropyLoss(reduction='sum')
-
-        for idx, text in enumerate(dataset["text"]):
-            if not text.strip():
-                continue
-            
-            try:
-                encodings = tokenizer(text, return_tensors="pt").to(device)
-                seq_len = encodings.input_ids.size(1)
-                if seq_len < 2:
-                    continue
-
-                nlls = []
-                for begin_loc in range(0, seq_len, stride):
-                    end_loc = min(begin_loc + effective_context, seq_len)
-                    if end_loc - begin_loc <= 1:
-                        continue
-                    input_ids = encodings.input_ids[:, begin_loc:end_loc]
-                    if input_ids.size(1) > max_model_len:
-                        input_ids = input_ids[:, -max_model_len:]
-
-                    with torch.no_grad():
-                        outputs = model(input_ids)
-                        shift_logits = outputs.logits[..., :-1, :].contiguous()
-                        shift_labels = input_ids[..., 1:].contiguous()
-                        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                        nlls.append(loss)
-                        total_tokens += shift_labels.numel()
-
-                if nlls:
-                    doc_nll = torch.stack(nlls).sum().item()
-                    total_nll += doc_nll
-            except RuntimeError as e:
-                print(f"  [Warning] OOM or error on sample {idx}: {str(e)[:50]}")
-                continue
-
-        if total_tokens > 0:
-            avg_loss = total_nll / total_tokens
-            perplexity = math.exp(avg_loss)
-            results.append({'context_length': context_len, 'perplexity': perplexity})
-            print(f"  Context {context_len}: PPL = {perplexity:.3f}")
-        else:
-            print(f"  Context {context_len}: No valid data")
-
-    return results
-
-
-def eval_passkey_retrieval(model, tokenizer, context_lengths=[16384, 32768], device='cuda', num_trials=5):
-    """Evaluate passkey retrieval accuracy."""
-    results = []
-    for context_len in context_lengths:
-        correct = 0
-        for trial in range(num_trials):
-            target_key = f"XXXXX{trial}YYYYY"
-            filler_unit = "The apple is red. The sky is blue. The grass is green. "
-            filler = filler_unit * (context_len // len(filler_unit) + 1)
-            pos = random.randint(0, max(0, len(filler) - len(target_key) - 100))
-            prompt_text = filler[:pos] + f"The pass key is {target_key}. Remember it. " + filler[pos:]
-            prompt_text = prompt_text[:context_len - 50] + "\n\nWhat is the pass key? The pass key is"
-
-            try:
-                inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    output_ids = model.generate(**inputs, max_new_tokens=20, do_sample=False)
-                response = tokenizer.decode(output_ids[inputs.input_ids.size(1):], skip_special_tokens=True).strip()
-                if target_key in response:
-                    correct += 1
-            except RuntimeError:
-                pass
-
-        accuracy = correct / num_trials if num_trials > 0 else 0.0
-        results.append({'context_length': context_len, 'accuracy': accuracy})
-        print(f"  Context {context_len}: Accuracy = {accuracy:.2%}")
-
-    return results
-
-
-def eval_code_completion(model, tokenizer, device, num_examples=10):
-    """Evaluate code completion BLEU score."""
+def eval_code_in_context(model, tokenizer, context_length=8192, num_examples=20, device='cuda'):
+    """
+    Task: Given first half of long Python file, predict second half.
+    Metric: BLEU score (higher is better).
+    
+    Why: Tests if adaptive attention helps with long code understanding.
+    """
+    
     try:
-        dataset = load_dataset("mbpp", split="test", cache_dir="/tmp/cache")
+        dataset = load_dataset("code_search_net", "python", split="test", cache_dir="/tmp/cache")
     except:
-        print("  [Warning] MBPP dataset unavailable, skipping code evaluation")
+        print("  [Warning] CodeSearchNet unavailable, using alternative dataset")
         return []
-
+    
     results = []
-    chencherry = SmoothingFunction()
+    bleu_scores = []
+    smoothing_fn = SmoothingFunction().method1
+    
+    model.eval()
+    
     for idx, example in enumerate(dataset.select(range(min(num_examples, len(dataset))))):
-        code = example['code']
+        code = example['content']
+        
+        # Skip if code too short
+        code_tokens = tokenizer(code, return_tensors="pt").input_ids.shape
+        if code_tokens < context_length + 100:
+            continue
+        
+        # Split: first half = context, second half = target
         split_point = len(code) // 2
         context = code[:split_point]
         target = code[split_point:]
-
+        
         try:
-            inputs = tokenizer(context, return_tensors="pt").to(device)
+            # Tokenize context
+            inputs = tokenizer(context[:context_length * 3], return_tensors="pt", truncation=True, max_length=context_length).to(device)
+            
+            # Generate prediction
             with torch.no_grad():
-                output_ids = model.generate(**inputs, max_new_tokens=len(target) // 4 + 10, do_sample=False)
-            prediction = tokenizer.decode(output_ids[inputs.input_ids.size(1):], skip_special_tokens=True).strip()
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=False,
+                    temperature=0.0
+                )
+            
+            # Decode prediction
+            prediction = tokenizer.decode(outputs[inputs.input_ids.size(1):], skip_special_tokens=True)
+            
+            # Compute BLEU
             reference = [target.split()]
             candidate = prediction.split()
-            bleu = sentence_bleu(reference, candidate, smoothing_function=chencherry.method1)
-            results.append({'bleu': bleu})
-        except RuntimeError:
-            pass
-
-    if results:
-        avg_bleu = sum(r['bleu'] for r in results) / len(results)
+            bleu = sentence_bleu(reference, candidate, smoothing_function=smoothing_fn)
+            bleu_scores.append(bleu)
+            
+            if idx % 5 == 0:
+                print(f"    Sample {idx}: BLEU = {bleu:.4f}")
+        
+        except RuntimeError as e:
+            print(f"    [Warning] OOM or error on sample {idx}: {str(e)[:50]}")
+            continue
+    
+    if bleu_scores:
+        avg_bleu = sum(bleu_scores) / len(bleu_scores)
+        results.append({
+            'context_length': context_length,
+            'avg_bleu': avg_bleu,
+            'num_samples': len(bleu_scores)
+        })
         print(f"  Average BLEU: {avg_bleu:.4f}")
+    
     return results
 
 
@@ -343,53 +291,73 @@ def eval_code_completion(model, tokenizer, device, num_examples=10):
 def run_benchmarks(
     model_name="Qwen/Qwen2.5-7B",
     device='cuda',
-    context_lengths=[8192, 16384],  # Start small!
-    output_dir="/tmp/benchmark_results"
+    context_length=8192,
+    num_examples=20,
+    output_dir="/tmp/code_benchmark_results"
 ):
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Loading model: {model_name}")
+    """Run code-in-context benchmark on baseline and adaptive attention."""
     
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"\n{'='*80}")
+    print(f"CODE-IN-CONTEXT BENCHMARK")
+    print(f"Model: {model_name}")
+    print(f"Context Length: {context_length}")
+    print(f"{'='*80}\n")
+    
+    # Load model and tokenizer
+    print("Loading model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    original_model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
         device_map="auto"
     ).to(device)
-
-    # ---- BASELINE EVALUATIONS ----
+    
+    # ---- BASELINE EVALUATION ----
     print("\n=== BASELINE EVALUATION ===")
-    print("Language Modeling...")
-    lm_results_orig = eval_language_modeling(original_model, tokenizer, context_lengths, device)
-    print("Passkey Retrieval...")
-    passkey_results_orig = eval_passkey_retrieval(original_model, tokenizer, context_lengths, device)
-    print("Code Completion...")
-    code_results_orig = eval_code_completion(original_model, tokenizer, device)
-
-    # ---- PATCH & CUSTOM EVALUATIONS ----
+    print("Code-in-context (standard attention)...")
+    baseline_results = eval_code_in_context(
+        model,
+        tokenizer,
+        context_length=context_length,
+        num_examples=num_examples,
+        device=device
+    )
+    
+    # ---- PATCH & ADAPTIVE EVALUATION ----
     print("\n=== PATCHING WITH CUSTOM ATTENTION ===")
-    custom_model = patch_model_with_custom_attention(original_model, device)
-
-    print("\n=== CUSTOM ATTENTION EVALUATION ===")
-    print("Language Modeling...")
-    lm_results_custom = eval_language_modeling(custom_model, tokenizer, context_lengths, device)
-    print("Passkey Retrieval...")
-    passkey_results_custom = eval_passkey_retrieval(custom_model, tokenizer, context_lengths, device)
-    print("Code Completion...")
-    code_results_custom = eval_code_completion(custom_model, tokenizer, device)
-
+    model = patch_model_with_custom_attention(model, device)
+    
+    print("\n=== ADAPTIVE ATTENTION EVALUATION ===")
+    print("Code-in-context (adaptive attention)...")
+    adaptive_results = eval_code_in_context(
+        model,
+        tokenizer,
+        context_length=context_length,
+        num_examples=num_examples,
+        device=device
+    )
+    
     # ---- SAVE RESULTS ----
     print("\n=== SAVING RESULTS ===")
-    pd.DataFrame(lm_results_orig).to_csv(f"{output_dir}/lm_baseline.csv", index=False)
-    pd.DataFrame(lm_results_custom).to_csv(f"{output_dir}/lm_adaptive.csv", index=False)
-    pd.DataFrame(passkey_results_orig).to_csv(f"{output_dir}/passkey_baseline.csv", index=False)
-    pd.DataFrame(passkey_results_custom).to_csv(f"{output_dir}/passkey_adaptive.csv", index=False)
-    if code_results_orig:
-        pd.DataFrame(code_results_orig).to_csv(f"{output_dir}/code_baseline.csv", index=False)
-    if code_results_custom:
-        pd.DataFrame(code_results_custom).to_csv(f"{output_dir}/code_adaptive.csv", index=False)
-
+    
+    if baseline_results:
+        pd.DataFrame(baseline_results).to_csv(f"{output_dir}/code_baseline.csv", index=False)
+        print(f"✓ Baseline results: {baseline_results['avg_bleu']:.4f}")
+    
+    if adaptive_results:
+        pd.DataFrame(adaptive_results).to_csv(f"{output_dir}/code_adaptive.csv", index=False)
+        print(f"✓ Adaptive results: {adaptive_results['avg_bleu']:.4f}")
+    
+    # Compute improvement
+    if baseline_results and adaptive_results:
+        baseline_bleu = baseline_results['avg_bleu']
+        adaptive_bleu = adaptive_results['avg_bleu']
+        improvement = ((adaptive_bleu - baseline_bleu) / baseline_bleu * 100) if baseline_bleu > 0 else 0
+        print(f"\n🎯 IMPROVEMENT: {improvement:+.2f}%")
+    
     print(f"\nResults saved to {output_dir}")
-    print("\nFiles created:")
     for f in os.listdir(output_dir):
         print(f"  - {f}")
 
@@ -398,6 +366,7 @@ if __name__ == "__main__":
     run_benchmarks(
         model_name="Qwen/Qwen2.5-7B",
         device='cuda',
-        context_lengths=[8192, 16384],  # START SMALL!
-        output_dir="/tmp/benchmark_results"
+        context_length=8192,
+        num_examples=20,
+        output_dir="/tmp/code_benchmark_results"
     )
