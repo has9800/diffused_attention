@@ -41,8 +41,6 @@ def load_mistral_model(
     load_kwargs = {}
     if hf_token:
         load_kwargs["use_auth_token"] = hf_token
-    if rope_factor != 1.0:
-        load_kwargs["rope_scaling"] = {"type": "linear", "factor": rope_factor}
 
     if quantization in {"4bit", "8bit"}:
         try:
@@ -71,7 +69,24 @@ def load_mistral_model(
     else:
         raise ValueError("quantization must be one of: none, 8bit, 4bit")
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    rope_kwargs = {}
+    effective_rope_factor = rope_factor
+    if rope_factor != 1.0:
+        rope_kwargs["rope_scaling"] = {"type": "linear", "factor": rope_factor}
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **rope_kwargs)
+    except TypeError as exc:
+        if "rope_scaling" in str(exc):
+            if rope_kwargs:
+                print(
+                    f"Warning: model {model_name} does not accept rope_scaling; "
+                    "falling back to default context window."
+                )
+                effective_rope_factor = 1.0
+            model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        else:
+            raise
 
     if quantization == "none":
         target_device = torch.device(device)
@@ -88,7 +103,7 @@ def load_mistral_model(
     tokenizer = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = max(max_context_length, int(rope_factor * 8192))
+    tokenizer.model_max_length = max(max_context_length, int(effective_rope_factor * 8192))
     model.config.pad_token_id = tokenizer.pad_token_id
 
     return model, tokenizer, str(target_device)
