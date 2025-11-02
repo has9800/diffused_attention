@@ -188,41 +188,57 @@ def patch_model_with_custom_attention(model, device):
         layer.self_attn = custom_attn
     return model
 
-# Evaluation functions (corrected and adapted)
-def eval_language_modeling(model, tokenizer, context_lengths, device, batch_size=1, stride=512):
+# Updated Evaluation functions
+def eval_language_modeling(model, tokenizer, context_lengths, device, batch_size=1, max_model_len=131072, stride=512):
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", cache_dir="/data/cache")
-    text = "\n\n".join(dataset["text"])
-    encodings = tokenizer(text, return_tensors="pt").to(device)
-    seq_len = encodings.input_ids.size(1)
     results = []
 
     for context_len in context_lengths:
-        nlls = []
-        prev_end_loc = 0
-        for begin_loc in range(0, seq_len, stride):
-            end_loc = min(begin_loc + context_len, seq_len)
-            if end_loc - begin_loc < context_len // 2:  # Skip small remnants
-                continue
-            input_ids = encodings.input_ids[:, begin_loc:end_loc]
-            target_ids = input_ids.clone()
-            target_ids[:, :-1] = -100  # Only last token? No, shift for LM
-            # For perplexity, labels = input_ids shifted, but model(input_ids, labels=input_ids) shifts internally
-            with torch.no_grad():
-                outputs = model(input_ids)
-                # Compute average loss
-                shift_logits = outputs.logits[..., :-1, :].contiguous()
-                shift_labels = input_ids[..., 1:].contiguous()
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            nlls.append(loss)
+        effective_context = min(context_len, max_model_len)
+        total_nll = 0.0
+        total_tokens = 0
+        loss_fct = nn.CrossEntropyLoss(reduction='sum')  # Sum for accumulation
 
-        if nlls:
-            avg_loss = torch.stack(nlls).mean().item()
+        for text in dataset["text"]:
+            if not text.strip():  # Skip empty
+                continue
+            encodings = tokenizer(text, return_tensors="pt").to(device)
+            seq_len = encodings.input_ids.size(1)
+            if seq_len < 2:  # Need at least 2 tokens for shift
+                continue
+
+            nlls = []
+            prev_end_loc = 0
+            for begin_loc in range(0, seq_len, stride):
+                end_loc = min(begin_loc + effective_context, seq_len)
+                if end_loc - begin_loc < effective_context // 2:
+                    continue
+                input_ids = encodings.input_ids[:, begin_loc:end_loc]
+                if input_ids.size(1) > max_model_len:
+                    input_ids = input_ids[:, -max_model_len:]
+
+                with torch.no_grad():
+                    outputs = model(input_ids)
+                    shift_logits = outputs.logits[..., :-1, :].contiguous()
+                    shift_labels = input_ids[..., 1:].contiguous()
+                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+                nlls.append(loss)
+                total_tokens += shift_labels.numel()  # Count processed tokens
+
+            if nlls:
+                doc_nll = torch.stack(nlls).sum().item()
+                total_nll += doc_nll
+
+        if total_tokens > 0:
+            avg_loss = total_nll / total_tokens
             perplexity = math.exp(avg_loss)
             results.append({
                 'context_length': context_len,
                 'perplexity': perplexity,
             })
+        else:
+            print(f"No valid data for context_len {context_len}")
 
     return results
 
