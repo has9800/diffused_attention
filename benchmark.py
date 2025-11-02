@@ -1,10 +1,7 @@
 import os
 os.environ['HF_HOME'] = '/data/huggingface_cache'
 os.environ['TRANSFORMERS_CACHE'] = '/data/huggingface_cache'
-os.environ['HF_DATASETS_CACHE'] = '/data/datasets_cache'
 os.makedirs('/data/huggingface_cache', exist_ok=True)
-os.makedirs('/data/datasets_cache', exist_ok=True)
-os.makedirs('/data/cache', exist_ok=True)
 
 import torch
 import torch.nn as nn
@@ -13,9 +10,9 @@ from typing import Optional, Tuple, Iterable, Sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb, repeat_kv
 from transformers.cache_utils import Cache
+from datasets import load_dataset
 import math
 import pandas as pd
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import nltk
 
 nltk.download('punkt', quiet=True)
@@ -210,134 +207,62 @@ def patch_model_with_custom_attention(model, device):
 
 
 # ============================================================================
-# GENERATE SYNTHETIC CODE FOR TESTING
+# BENCHMARK: HUMANEVAL CODE UNDERSTANDING
 # ============================================================================
 
-def generate_code_samples(num_samples=5):
-    """Generate simple Python code for testing."""
-    samples = []
-    for i in range(num_samples):
-        code = f"""
-# Python code sample {i}
-def function_{i}(x, y):
-    '''Function that does something with x and y'''
-    result = x + y
-    for j in range(result):
-        print(f"Iteration {{j}}: {{x}} + {{y}} = {{result}}")
-    
-    if result > 10:
-        print("Result is large")
-        nested_result = result * 2
-        for k in range(nested_result):
-            value = k * result
-            if value % 2 == 0:
-                print(f"Even: {{value}}")
-    
-    return result
-
-class MyClass_{i}:
-    def __init__(self, name):
-        self.name = name
-    
-    def method(self, param):
-        data = []
-        for idx in range(len(param)):
-            item = param[idx]
-            processed = item * 2
-            data.append(processed)
-        return data
-
-def process_data_{i}(items):
-    output = []
-    for item in items:
-        if isinstance(item, int):
-            output.append(item ** 2)
-        elif isinstance(item, str):
-            output.append(item.upper())
-        else:
-            output.append(None)
-    return output
-
-# More code...
-x = [1, 2, 3, 4, 5]
-y = "hello"
-z = MyClass_{i}("test")
-result = process_data_{i}(x)
-print(result)
-""" * 3  # Repeat to make it longer
-        samples.append(code)
-    return samples
-
-
-# ============================================================================
-# BENCHMARK: CODE-IN-CONTEXT
-# ============================================================================
-
-def eval_code_in_context(model, tokenizer, context_length=4096, num_samples=5, device='cuda'):
+def eval_humaneval(model, tokenizer, num_samples=10, device='cuda'):
     """
-    Task: Given first half of code, predict second half.
-    Metric: BLEU score.
+    Task: Given HumanEval code problems, compute perplexity.
+    Metric: Perplexity on held-out code.
+    Why: Real, curated Python code that tests understanding.
     """
     
-    # Generate code samples
-    code_samples = generate_code_samples(num_samples)
+    # Load HumanEval
+    print("  Loading HumanEval dataset...")
+    try:
+        dataset = load_dataset("openai_humaneval", split="test")
+    except Exception as e:
+        print(f"  Error loading dataset: {e}")
+        return []
     
     results = []
-    bleu_scores = []
-    smoothing_fn = SmoothingFunction().method1
+    losses = []
     
     model.eval()
     
-    for idx, code in enumerate(code_samples):
-        if len(code) < 500:
-            continue
-        
-        # Split: first half = context, second half = target
-        split_point = len(code) // 2
-        context = code[:split_point]
-        target = code[split_point:]
-        
+    # Evaluate on first N samples
+    for idx in range(min(num_samples, len(dataset))):
         try:
-            # Tokenize context
-            inputs = tokenizer(
-                context,
-                return_tensors="pt",
-                truncation=True,
-                max_length=context_length
-            ).to(device)
+            example = dataset[idx]
+            code = example['prompt'] + example['canonical_solution']
             
-            # Generate prediction
+            # Tokenize
+            inputs = tokenizer(code, return_tensors="pt", truncation=True, max_length=4096).to(device)
+            
+            # Compute loss
             with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False,
-                    temperature=0.0
-                )
+                outputs = model(**inputs, labels=inputs.input_ids)
             
-            # Decode prediction
-            prediction = tokenizer.decode(outputs[inputs.input_ids.size(1):], skip_special_tokens=True)
+            loss = outputs.loss.item()
+            losses.append(loss)
             
-            # Compute BLEU
-            reference = [target.split()]
-            candidate = prediction.split()
-            bleu = sentence_bleu(reference, candidate, smoothing_function=smoothing_fn)
-            bleu_scores.append(bleu)
-            
-            print(f"    Sample {idx}: BLEU = {bleu:.4f}")
+            if idx % 3 == 0:
+                ppl = math.exp(loss)
+                print(f"    Sample {idx}: PPL = {ppl:.4f}")
         
-        except RuntimeError as e:
+        except Exception as e:
             print(f"    [Warning] Error on sample {idx}: {str(e)[:50]}")
             continue
     
-    if bleu_scores:
-        avg_bleu = sum(bleu_scores) / len(bleu_scores)
+    if losses:
+        avg_loss = sum(losses) / len(losses)
+        ppl = math.exp(avg_loss)
         results.append({
-            'context_length': context_length,
-            'avg_bleu': avg_bleu,
-            'num_samples': len(bleu_scores)
+            'metric': 'perplexity',
+            'value': ppl,
+            'num_samples': len(losses)
         })
-        print(f"  ✓ Average BLEU: {avg_bleu:.4f}")
+        print(f"  ✓ Average PPL: {ppl:.4f}")
     else:
         print(f"  ✗ No valid samples")
     
@@ -351,18 +276,17 @@ def eval_code_in_context(model, tokenizer, context_length=4096, num_samples=5, d
 def run_benchmarks(
     model_name="Qwen/Qwen2.5-7B",
     device='cuda',
-    context_length=4096,
-    num_samples=5,
-    output_dir="/tmp/code_benchmark_results"
+    num_samples=10,
+    output_dir="/tmp/humaneval_benchmark"
 ):
-    """Run code-in-context benchmark."""
+    """Run HumanEval benchmark."""
     
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\n{'='*80}")
-    print(f"CODE-IN-CONTEXT BENCHMARK (Synthetic)")
+    print(f"HUMANEVAL CODE BENCHMARK")
     print(f"Model: {model_name}")
-    print(f"Context Length: {context_length}")
+    print(f"Samples: {num_samples}")
     print(f"{'='*80}\n")
     
     # Load model and tokenizer
@@ -376,54 +300,40 @@ def run_benchmarks(
     
     # ---- BASELINE ----
     print("\n=== BASELINE EVALUATION ===")
-    baseline_results = eval_code_in_context(
-        model,
-        tokenizer,
-        context_length=context_length,
-        num_samples=num_samples,
-        device=device
-    )
+    baseline_results = eval_humaneval(model, tokenizer, num_samples=num_samples, device=device)
     
     # ---- PATCH & ADAPTIVE ----
     print("\n=== PATCHING WITH CUSTOM ATTENTION ===")
     model = patch_model_with_custom_attention(model, device)
     
     print("\n=== ADAPTIVE ATTENTION EVALUATION ===")
-    adaptive_results = eval_code_in_context(
-        model,
-        tokenizer,
-        context_length=context_length,
-        num_samples=num_samples,
-        device=device
-    )
+    adaptive_results = eval_humaneval(model, tokenizer, num_samples=num_samples, device=device)
     
     # ---- SAVE & COMPARE ----
     print("\n=== RESULTS ===")
     
-    if baseline_results:
-        pd.DataFrame(baseline_results).to_csv(f"{output_dir}/code_baseline.csv", index=False)
-        baseline_bleu = baseline_results['avg_bleu']
-        print(f"Baseline BLEU: {baseline_bleu:.4f}")
-    
-    if adaptive_results:
-        pd.DataFrame(adaptive_results).to_csv(f"{output_dir}/code_adaptive.csv", index=False)
-        adaptive_bleu = adaptive_results['avg_bleu']
-        print(f"Adaptive BLEU: {adaptive_bleu:.4f}")
-    
     if baseline_results and adaptive_results:
-        baseline_bleu = baseline_results['avg_bleu']
-        adaptive_bleu = adaptive_results['avg_bleu']
-        improvement = ((adaptive_bleu - baseline_bleu) / (baseline_bleu + 1e-9) * 100)
+        baseline_ppl = baseline_results['value']
+        adaptive_ppl = adaptive_results['value']
+        improvement = ((baseline_ppl - adaptive_ppl) / baseline_ppl * 100) if baseline_ppl > 0 else 0
+        
+        print(f"Baseline PPL: {baseline_ppl:.4f}")
+        print(f"Adaptive PPL: {adaptive_ppl:.4f}")
         print(f"\n🎯 IMPROVEMENT: {improvement:+.2f}%")
-    
-    print(f"\nResults saved to {output_dir}/")
+        
+        # Save
+        pd.DataFrame([
+            {'method': 'baseline', 'perplexity': baseline_ppl, 'samples': baseline_results['num_samples']},
+            {'method': 'adaptive', 'perplexity': adaptive_ppl, 'samples': adaptive_results['num_samples']},
+        ]).to_csv(f"{output_dir}/results.csv", index=False)
+        
+        print(f"\nResults saved to {output_dir}/results.csv")
 
 
 if __name__ == "__main__":
     run_benchmarks(
         model_name="Qwen/Qwen2.5-7B",
         device='cuda',
-        context_length=4096,
-        num_samples=5,
-        output_dir="/tmp/code_benchmark_results"
+        num_samples=10,
+        output_dir="/tmp/humaneval_benchmark"
     )
