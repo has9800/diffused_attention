@@ -75,21 +75,23 @@ class AdaptivePerHeadAttention(nn.Module):
         sink_mask[sink_indices] = True
         content_mask = ~sink_mask
 
-        # Convert to float32 for stability
+        # Cast to float32 for stability
         weights_fp32 = weights.float()
+
+        # Prepare epsilon in float32
         epsilon_expanded = self._prepare_epsilon(epsilon, self.num_heads, weights.device, weights_fp32.dtype)
 
-        sink_mass = weights_fp32[..., sink_mask].sum(dim=-1, keepdim=True)
-        content_mass = weights_fp32[..., content_mask].sum(dim=-1, keepdim=True)
+        # Compute sums in float32
+        sink_mass = weights_fp32[..., sink_mask].sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        content_mass = weights_fp32[..., content_mask].sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
+        # Propagate
         output = torch.zeros_like(weights_fp32)
-        output[..., content_mask] = (weights_fp32[..., content_mask] * (1.0 - epsilon_expanded) / (content_mass + 1e-6))
-        output[..., sink_mask] = (weights_fp32[..., sink_mask] * epsilon_expanded / (sink_mass + 1e-6))
+        output[..., content_mask] = (weights_fp32[..., content_mask] * (1.0 - epsilon_expanded) / (content_mass))
+        output[..., sink_mask] = (weights_fp32[..., sink_mask] * epsilon_expanded / (sink_mass))
 
-        # Cast back to original dtype
+        # Cast back
         return output.to(weights.dtype)
-
-
 
     def forward(
         self,
@@ -102,8 +104,14 @@ class AdaptivePerHeadAttention(nn.Module):
         epsilon, temperature = self.get_adaptive_params()
         temperature = temperature.to(device=scores.device, dtype=scores.dtype)
         temperature = temperature.view(1, self.num_heads, 1, 1).clamp_min(1e-4)
+
+        # CLAMP scores to prevent numeric overflow/underflow for softmax
+        scores = torch.clamp(scores, min=-20, max=20)
         scores = scores / temperature
+
+        # Use softmax in float32 for stability, cast back afterward
         probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=scores.dtype)
+
         if self.enable_two_pool:
             probs = self.two_pool_renormalization(probs, epsilon, sink_indices=sink_indices)
         return probs
